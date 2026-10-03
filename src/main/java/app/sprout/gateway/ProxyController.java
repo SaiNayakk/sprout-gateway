@@ -1,0 +1,193 @@
+package app.sprout.gateway;
+
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
+import io.micrometer.core.instrument.MeterRegistry;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import java.io.IOException;
+import java.net.ConnectException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.net.http.HttpTimeoutException;
+import java.time.Duration;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Locale;
+import java.util.Optional;
+import java.util.Set;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+/**
+ * Forwards {@code /api/<service>/...} to the owning service. In order: route, rate limit, token
+ * check, strip headers a client must not set, forward through a circuit breaker, copy the reply.
+ */
+@RestController
+public class ProxyController {
+
+    private static final Logger log = LoggerFactory.getLogger(ProxyController.class);
+
+    /** Never forwarded in either direction (RFC 9110 hop-by-hop), or set by the HTTP client itself. */
+    private static final Set<String> HOP_BY_HOP = Set.of("connection", "keep-alive", "proxy-authenticate",
+            "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "host", "content-length",
+            "expect");
+    /** Identity headers only the gateway may set; a client sending them is ignored. */
+    private static final Set<String> SPOOFABLE = Set.of("x-user-id", "x-session-id", "x-forwarded-for",
+            "x-forwarded-proto", "x-forwarded-host", "x-real-ip", "forwarded");
+
+    private final GatewayProperties props;
+    private final TokenVerifier tokens;
+    private final RateLimiter limiter;
+    private final MeterRegistry meters;
+    private final HttpClient http;
+    private final CircuitBreakerRegistry breakers;
+    private final List<GatewayProperties.Route> routes;
+
+    public ProxyController(GatewayProperties props, TokenVerifier tokens, RateLimiter limiter, MeterRegistry meters) {
+        this.props = props;
+        this.tokens = tokens;
+        this.limiter = limiter;
+        this.meters = meters;
+        this.http = HttpClient.newBuilder().connectTimeout(props.connectTimeout())
+                .followRedirects(HttpClient.Redirect.NEVER).build();
+        this.breakers = CircuitBreakerRegistry.of(CircuitBreakerConfig.custom()
+                .slidingWindowSize(20)
+                .minimumNumberOfCalls(10)
+                .failureRateThreshold(50)
+                .waitDurationInOpenState(Duration.ofSeconds(10))
+                .permittedNumberOfCallsInHalfOpenState(3)
+                .recordResult(r -> r instanceof HttpResponse<?> response && response.statusCode() >= 500)
+                .build());
+        // longest prefix wins, so /api/identity-admin can never be captured by /api/identity
+        this.routes = props.routes().stream()
+                .sorted(Comparator.comparingInt((GatewayProperties.Route r) -> r.prefix().length()).reversed())
+                .toList();
+    }
+
+    @RequestMapping("/api/**")
+    public void proxy(HttpServletRequest req, HttpServletResponse res) throws IOException {
+        String uri = req.getRequestURI();
+        Optional<GatewayProperties.Route> match = routes.stream()
+                .filter(r -> uri.equals(r.prefix()) || uri.startsWith(r.prefix() + "/")).findFirst();
+        if (match.isEmpty()) {
+            Problems.write(res, 404, "NOT_FOUND", "Not found", "There's no API at this address.", null);
+            return;
+        }
+        GatewayProperties.Route route = match.get();
+        String path = uri.substring(route.prefix().length());
+        String lowerPath = path.toLowerCase(Locale.ROOT);
+        if (path.isEmpty() || path.contains("..") || path.contains("//") || lowerPath.contains("%2e")
+                || lowerPath.contains("%2f") || lowerPath.contains("%5c") || path.contains("\\")) {
+            Problems.write(res, 404, "NOT_FOUND", "Not found", "There's no API at this address.", null);
+            return;
+        }
+        String method = req.getMethod().toUpperCase(Locale.ROOT);
+        String client = clientAddress(req);
+
+        boolean authLimited = route.isAuthLimited(method, path);
+        int perMinute = authLimited ? props.rateLimits().authPerMinute() : props.rateLimits().defaultPerMinute();
+        long wait = limiter.tryAcquire(client + "|" + (authLimited ? "auth" : "default"), perMinute);
+        if (wait > 0) {
+            meters.counter("gateway.rate_limited", "route", route.name(), "class", authLimited ? "auth" : "default").increment();
+            Problems.write(res, 429, "RATE_LIMITED", "Too many requests",
+                    "Slow down and try again in " + wait + " seconds.", wait);
+            return;
+        }
+
+        Optional<TokenVerifier.Caller> caller = tokens.verify(req.getHeader("Authorization"));
+        if (caller.isEmpty() && !route.isPublic(method, path)) {
+            meters.counter("gateway.unauthenticated", "route", route.name()).increment();
+            Problems.write(res, 401, "UNAUTHENTICATED", "Sign in to continue",
+                    "This needs a valid access token.", null);
+            return;
+        }
+
+        byte[] body = req.getInputStream().readNBytes((int) props.maxBodyBytes() + 1);
+        if (body.length > props.maxBodyBytes()) {
+            Problems.write(res, 413, "VALIDATION_FAILED", "Request too large",
+                    "Requests can be at most " + props.maxBodyBytes() / 1024 + " KB.", null);
+            return;
+        }
+
+        HttpRequest upstream = buildUpstream(req, route, path, method, body, client, caller);
+        CircuitBreaker breaker = breakers.circuitBreaker(route.name());
+        try {
+            HttpResponse<byte[]> reply = breaker.executeCheckedSupplier(
+                    () -> http.send(upstream, HttpResponse.BodyHandlers.ofByteArray()));
+            copyReply(reply, res);
+        } catch (CallNotPermittedException e) {
+            meters.counter("gateway.upstream_errors", "route", route.name(), "kind", "circuit_open").increment();
+            Problems.write(res, 503, "UPSTREAM_UNAVAILABLE", "Temporarily unavailable",
+                    "This part of Sprout is recovering. Try again in a few seconds.", 10L);
+        } catch (HttpTimeoutException e) {
+            meters.counter("gateway.upstream_errors", "route", route.name(), "kind", "timeout").increment();
+            Problems.write(res, 504, "UPSTREAM_UNAVAILABLE", "Took too long",
+                    "This took too long. It may still have happened, so check before retrying.", null);
+        } catch (ConnectException e) {
+            meters.counter("gateway.upstream_errors", "route", route.name(), "kind", "connect").increment();
+            Problems.write(res, 503, "UPSTREAM_UNAVAILABLE", "Temporarily unavailable",
+                    "This part of Sprout isn't reachable right now. Try again shortly.", 5L);
+        } catch (Throwable e) {
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            log.warn("Upstream call to {} failed", route.name(), e);
+            meters.counter("gateway.upstream_errors", "route", route.name(), "kind", "other").increment();
+            Problems.write(res, 502, "UPSTREAM_UNAVAILABLE", "Something went wrong",
+                    "The service behind this didn't answer properly. Try again.", null);
+        }
+    }
+
+    private HttpRequest buildUpstream(HttpServletRequest req, GatewayProperties.Route route, String path, String method,
+                                      byte[] body, String client, Optional<TokenVerifier.Caller> caller) {
+        String query = req.getQueryString();
+        URI target = URI.create(route.target() + path + (query == null ? "" : "?" + query));
+        HttpRequest.Builder b = HttpRequest.newBuilder(target).timeout(props.requestTimeout())
+                .method(method, body.length == 0 ? HttpRequest.BodyPublishers.noBody() : HttpRequest.BodyPublishers.ofByteArray(body));
+        for (String name : Collections.list(req.getHeaderNames())) {
+            String lower = name.toLowerCase(Locale.ROOT);
+            if (HOP_BY_HOP.contains(lower) || SPOOFABLE.contains(lower) || lower.equals(EdgeFilter.REQUEST_ID.toLowerCase(Locale.ROOT))) {
+                continue;
+            }
+            for (String value : Collections.list(req.getHeaders(name))) {
+                b.header(name, value);
+            }
+        }
+        b.header(EdgeFilter.REQUEST_ID, (String) req.getAttribute(EdgeFilter.REQUEST_ID));
+        b.header("X-Forwarded-For", client);
+        b.header("X-Forwarded-Proto", req.getHeader("CF-Visitor") != null ? "https" : req.getScheme());
+        caller.ifPresent(c -> {
+            b.header("X-User-Id", c.userId());
+            b.header("X-Session-Id", c.sessionId());
+        });
+        return b.build();
+    }
+
+    private static void copyReply(HttpResponse<byte[]> reply, HttpServletResponse res) throws IOException {
+        res.setStatus(reply.statusCode());
+        reply.headers().map().forEach((name, values) -> {
+            String lower = name.toLowerCase(Locale.ROOT);
+            if (!HOP_BY_HOP.contains(lower) && !lower.equals(EdgeFilter.REQUEST_ID.toLowerCase(Locale.ROOT))
+                    && !lower.startsWith(":")) {
+                values.forEach(v -> res.addHeader(name, v));
+            }
+        });
+        res.getOutputStream().write(reply.body());
+    }
+
+    private String clientAddress(HttpServletRequest req) {
+        String cf = req.getHeader("CF-Connecting-IP");
+        if (props.trustCloudflareIp() && cf != null && !cf.isBlank()) {
+            return cf.trim();
+        }
+        return req.getRemoteAddr();
+    }
+}
