@@ -19,7 +19,7 @@ jobs:
           distribution: temurin
           java-version: '21'
           cache: maven
-      - name: Build and tests (stub upstream: tokens, limits, timeouts, circuit breaker)
+      - name: "Build and tests (stub upstream: tokens, limits, timeouts, circuit breaker)"
         run: mvn -B verify
       - name: Upload test reports
         if: always()
