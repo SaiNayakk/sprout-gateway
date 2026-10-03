@@ -1,0 +1,84 @@
+# Configuration for the gateway. Named gateway.yml (not application.yml) so it can share a JVM
+# host with other services without their settings colliding.
+spring:
+  application:
+    name: sprout-gateway
+  jmx:
+    enabled: false
+  mvc:
+    problemdetails:
+      enabled: false
+
+server:
+  port: ${GATEWAY_PORT:8100}
+  address: ${GATEWAY_BIND:0.0.0.0}
+  tomcat:
+    threads:
+      max: 32
+    max-http-form-post-size: 1MB
+    max-swallow-size: 1MB
+
+management:
+  server:
+    port: ${GATEWAY_MANAGEMENT_PORT:8190}
+    address: 127.0.0.1
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,circuitbreakers
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  otlp:
+    metrics:
+      export:
+        enabled: ${OTEL_ENABLED:false}
+        url: ${OTEL_METRICS_URL:http://localhost:4318/v1/metrics}
+        step: 15s
+    tracing:
+      endpoint: ${OTEL_TRACES_URL:http://localhost:4318/v1/traces}
+  tracing:
+    enabled: ${OTEL_ENABLED:false}
+    sampling:
+      probability: 1.0
+  metrics:
+    tags:
+      service: sprout-gateway
+
+logging:
+  structured:
+    format:
+      console: ${LOG_FORMAT:}
+  pattern:
+    correlation: "[%X{requestId:-}] "
+
+sprout:
+  gateway:
+    issuer: sprout-identity
+    audience: sprout
+    jwks-url: ${GATEWAY_JWKS_URL:http://127.0.0.1:8101/.well-known/jwks.json}
+    connect-timeout: 2s
+    request-timeout: 5s
+    max-body-bytes: 1048576
+    # Behind Cloudflare the real client address is in CF-Connecting-IP; trust it only when true.
+    trust-cloudflare-ip: ${GATEWAY_TRUST_CF_IP:false}
+    rate-limits:
+      auth-per-minute: 10
+      default-per-minute: 120
+    routes:
+      - name: identity
+        prefix: /api/identity
+        target: ${GATEWAY_IDENTITY_URL:http://127.0.0.1:8101}
+        # Reachable without a token. Everything else under the prefix needs a valid access token.
+        public:
+          - POST /v1/users
+          - POST /v1/sessions
+          - POST /v1/sessions/totp
+          - POST /v1/tokens/refresh
+          - GET /.well-known/jwks.json
+        auth-limited:
+          - POST /v1/users
+          - POST /v1/sessions
+          - POST /v1/sessions/totp
+          - POST /v1/tokens/refresh
