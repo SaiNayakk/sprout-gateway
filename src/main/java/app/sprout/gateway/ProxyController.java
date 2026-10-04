@@ -5,9 +5,14 @@ import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
 import io.micrometer.core.instrument.MeterRegistry;
+import jakarta.servlet.AsyncContext;
+import jakarta.servlet.AsyncEvent;
+import jakarta.servlet.AsyncListener;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.ConnectException;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -29,6 +34,10 @@ import org.springframework.web.bind.annotation.RestController;
 /**
  * Forwards {@code /api/<service>/...} to the owning service. In order: route, rate limit, token
  * check, strip headers a client must not set, forward through a circuit breaker, copy the reply.
+ *
+ * <p>Endpoints a route lists under {@code streams} are Server-Sent Events: the reply is relayed as
+ * it arrives, for as long as both ends stay connected, on a virtual thread rather than a request
+ * thread. Open streams are capped per client and in total.
  */
 @RestController
 public class ProxyController {
@@ -50,6 +59,7 @@ public class ProxyController {
     private final HttpClient http;
     private final CircuitBreakerRegistry breakers;
     private final List<GatewayProperties.Route> routes;
+    private final StreamSlots slots;
 
     public ProxyController(GatewayProperties props, TokenVerifier tokens, RateLimiter limiter, MeterRegistry meters) {
         this.props = props;
@@ -66,6 +76,8 @@ public class ProxyController {
                 .permittedNumberOfCallsInHalfOpenState(3)
                 .recordResult(r -> r instanceof HttpResponse<?> response && response.statusCode() >= 500)
                 .build());
+        GatewayProperties.Streams s = props.streams() != null ? props.streams() : new GatewayProperties.Streams(5, 500);
+        this.slots = new StreamSlots(s.perClient(), s.total(), meters);
         // longest prefix wins, so /api/identity-admin can never be captured by /api/identity
         this.routes = props.routes().stream()
                 .sorted(Comparator.comparingInt((GatewayProperties.Route r) -> r.prefix().length()).reversed())
@@ -110,6 +122,11 @@ public class ProxyController {
             return;
         }
 
+        if (route.isStream(method, path)) {
+            stream(req, res, route, path, method, client, caller);
+            return;
+        }
+
         byte[] body = req.getInputStream().readNBytes((int) props.maxBodyBytes() + 1);
         if (body.length > props.maxBodyBytes()) {
             Problems.write(res, 413, "VALIDATION_FAILED", "Request too large",
@@ -146,6 +163,109 @@ public class ProxyController {
         }
     }
 
+    private void stream(HttpServletRequest req, HttpServletResponse res, GatewayProperties.Route route, String path,
+                        String method, String client, Optional<TokenVerifier.Caller> caller) throws IOException {
+        switch (slots.tryOpen(client)) {
+            case CLIENT_FULL -> {
+                meters.counter("gateway.streams.refused", "route", route.name(), "reason", "client").increment();
+                Problems.write(res, 429, "RATE_LIMITED", "Too many open streams",
+                        "Close a price stream you no longer need, then try again.", 5L);
+                return;
+            }
+            case GATEWAY_FULL -> {
+                meters.counter("gateway.streams.refused", "route", route.name(), "reason", "gateway").increment();
+                Problems.write(res, 503, "UPSTREAM_UNAVAILABLE", "Temporarily unavailable",
+                        "Too many people are watching prices right now. Try again shortly.", 10L);
+                return;
+            }
+            case OPENED -> { }
+        }
+        boolean handedOver = false;
+        try {
+            HttpRequest upstream = buildUpstream(req, route, path, method, new byte[0], client, caller);
+            HttpResponse<InputStream> reply;
+            try {
+                // the timeout covers getting the response headers; the body then flows for as long as it lasts
+                reply = breakers.circuitBreaker(route.name()).executeCheckedSupplier(
+                        () -> http.send(upstream, HttpResponse.BodyHandlers.ofInputStream()));
+            } catch (CallNotPermittedException e) {
+                Problems.write(res, 503, "UPSTREAM_UNAVAILABLE", "Temporarily unavailable",
+                        "This part of Sprout is recovering. Try again in a few seconds.", 10L);
+                return;
+            } catch (HttpTimeoutException e) {
+                Problems.write(res, 504, "UPSTREAM_UNAVAILABLE", "Took too long",
+                        "The stream did not start in time. Try again.", null);
+                return;
+            } catch (Throwable e) {
+                if (e instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                }
+                Problems.write(res, 503, "UPSTREAM_UNAVAILABLE", "Temporarily unavailable",
+                        "This part of Sprout is not reachable right now. Try again shortly.", 5L);
+                return;
+            }
+            boolean isStream = reply.statusCode() == 200 && reply.headers().firstValue("content-type")
+                    .map(ct -> ct.startsWith("text/event-stream")).orElse(false);
+            copyHeaders(reply, res);
+            if (!isStream) {
+                // the service refused (unknown symbol, bad request, ...): pass its answer on as is
+                try (InputStream in = reply.body()) {
+                    in.transferTo(res.getOutputStream());
+                }
+                return;
+            }
+            res.setHeader("X-Accel-Buffering", "no"); // tell any proxy in front not to buffer
+            AsyncContext async = req.startAsync();
+            async.setTimeout(0);
+            InputStream in = reply.body();
+            async.addListener(new AsyncListener() {
+                @Override public void onComplete(AsyncEvent e) { }
+                @Override public void onTimeout(AsyncEvent e) { closeQuietly(in); }
+                @Override public void onError(AsyncEvent e) { closeQuietly(in); }
+                @Override public void onStartAsync(AsyncEvent e) { }
+            });
+            res.flushBuffer();
+            meters.counter("gateway.streams.opened", "route", route.name()).increment();
+            Thread.ofVirtual().name("gw-stream-" + route.name()).start(() -> relay(in, async, client, route));
+            handedOver = true;
+        } finally {
+            if (!handedOver) {
+                slots.close(client);
+            }
+        }
+    }
+
+    /** Copies the stream until either side goes away, then closes both so the service lets go too. */
+    private void relay(InputStream in, AsyncContext async, String client, GatewayProperties.Route route) {
+        try (in) {
+            OutputStream out = async.getResponse().getOutputStream();
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) != -1) {
+                out.write(buf, 0, n);
+                out.flush();
+            }
+        } catch (IOException | IllegalStateException e) {
+            // the client or the service hung up: normal for a stream
+        } finally {
+            slots.close(client);
+            meters.counter("gateway.streams.closed", "route", route.name()).increment();
+            try {
+                async.complete();
+            } catch (IllegalStateException ignored) {
+                // already completed by the container after a client error
+            }
+        }
+    }
+
+    private static void closeQuietly(InputStream in) {
+        try {
+            in.close();
+        } catch (IOException ignored) {
+            // nothing more to do
+        }
+    }
+
     private HttpRequest buildUpstream(HttpServletRequest req, GatewayProperties.Route route, String path, String method,
                                       byte[] body, String client, Optional<TokenVerifier.Caller> caller) {
         String query = req.getQueryString();
@@ -172,6 +292,11 @@ public class ProxyController {
     }
 
     private static void copyReply(HttpResponse<byte[]> reply, HttpServletResponse res) throws IOException {
+        copyHeaders(reply, res);
+        res.getOutputStream().write(reply.body());
+    }
+
+    private static void copyHeaders(HttpResponse<?> reply, HttpServletResponse res) {
         res.setStatus(reply.statusCode());
         reply.headers().map().forEach((name, values) -> {
             String lower = name.toLowerCase(Locale.ROOT);
@@ -180,7 +305,6 @@ public class ProxyController {
                 values.forEach(v -> res.addHeader(name, v));
             }
         });
-        res.getOutputStream().write(reply.body());
     }
 
     private String clientAddress(HttpServletRequest req) {

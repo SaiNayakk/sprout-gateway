@@ -1,2 +1,6 @@
-jdk:
-  - openjdk21
+# JitPack's install step runs on the image's system Java 8 even when another JDK is selected
+# (seen 2026-10-04), so install Java 21 and point JAVA_HOME and PATH at it explicitly.
+before_install:
+  - sdk install java 21.0.4-tem
+install:
+  - export JAVA_HOME="$HOME/.sdkman/candidates/java/21.0.4-tem" && export PATH="$JAVA_HOME/bin:$PATH" && ./mvnw -B install -DskipTests

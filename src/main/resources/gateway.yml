@@ -66,6 +66,10 @@ sprout:
     rate-limits:
       auth-per-minute: 10
       default-per-minute: 120
+    # price streams stay open for minutes or hours, so they're counted rather than rate limited
+    streams:
+      per-client: 5
+      total: 500
     routes:
       - name: identity
         prefix: /api/identity
@@ -82,3 +86,12 @@ sprout:
           - POST /v1/sessions
           - POST /v1/sessions/totp
           - POST /v1/tokens/refresh
+      - name: marketdata
+        prefix: /api/marketdata
+        target: ${GATEWAY_MARKETDATA_URL:http://127.0.0.1:8103}
+        public:
+          - GET /v1/market
+          - GET /v1/instruments
+          - GET /v1/instruments/{symbol}
+        streams:
+          - GET /v1/stream
