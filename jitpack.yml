@@ -1,8 +1,0 @@
-# JitPack's install step runs on the image's system Java 8 even when another JDK is selected
-# (seen 2026-10-04), so install Java 21 and point JAVA_HOME and PATH at it explicitly.
-# Builds of this repo also failed intermittently inside the Maven wrapper; MVNW_VERBOSE logs what
-# it does, and a failure clears its download and retries once.
-before_install:
-  - sdk install java 21.0.4-tem
-install:
-  - export JAVA_HOME="$HOME/.sdkman/candidates/java/21.0.4-tem" && export PATH="$JAVA_HOME/bin:$PATH" && export MVNW_VERBOSE=true && (./mvnw -B install -DskipTests || (rm -rf "$HOME/.m2/wrapper" && ./mvnw -B install -DskipTests))

@@ -11,7 +11,7 @@
     <relativePath/>
   </parent>
 
-  <!-- Published through JitPack from git tags: com.github.SaiNayakk:sprout-gateway:<tag> -->
+  <!-- Released as git tags vX.Y.Z; hosts build a release from its tag (sprout-platform ADR-011). -->
   <groupId>com.github.SaiNayakk</groupId>
   <artifactId>sprout-gateway</artifactId>
   <version>0.2.4</version>
