@@ -18,6 +18,7 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.net.http.HttpConnectTimeoutException;
 import java.net.http.HttpTimeoutException;
 import java.time.Duration;
 import java.util.Collections;
@@ -144,6 +145,12 @@ public class ProxyController {
             meters.counter("gateway.upstream_errors", "route", route.name(), "kind", "circuit_open").increment();
             Problems.write(res, 503, "UPSTREAM_UNAVAILABLE", "Temporarily unavailable",
                     "This part of Sprout is recovering. Try again in a few seconds.", 10L);
+        } catch (HttpConnectTimeoutException e) {
+            // Never connected, so the request never arrived: certainly not done, safe to retry.
+            // (Found by CHAOS-03: a killed host's address still resolves but nothing answers.)
+            meters.counter("gateway.upstream_errors", "route", route.name(), "kind", "connect_timeout").increment();
+            Problems.write(res, 503, "UPSTREAM_UNAVAILABLE", "Temporarily unavailable",
+                    "This part of Sprout isn't reachable right now. Try again shortly.", 5L);
         } catch (HttpTimeoutException e) {
             meters.counter("gateway.upstream_errors", "route", route.name(), "kind", "timeout").increment();
             Problems.write(res, 504, "UPSTREAM_UNAVAILABLE", "Took too long",
@@ -191,6 +198,10 @@ public class ProxyController {
             } catch (CallNotPermittedException e) {
                 Problems.write(res, 503, "UPSTREAM_UNAVAILABLE", "Temporarily unavailable",
                         "This part of Sprout is recovering. Try again in a few seconds.", 10L);
+                return;
+            } catch (HttpConnectTimeoutException e) {
+                Problems.write(res, 503, "UPSTREAM_UNAVAILABLE", "Temporarily unavailable",
+                        "This part of Sprout is not reachable right now. Try again shortly.", 5L);
                 return;
             } catch (HttpTimeoutException e) {
                 Problems.write(res, 504, "UPSTREAM_UNAVAILABLE", "Took too long",
