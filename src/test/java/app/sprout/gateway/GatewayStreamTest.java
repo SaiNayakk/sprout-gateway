@@ -23,6 +23,10 @@ import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
+import java.util.concurrent.TimeUnit;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.test.context.DynamicPropertyRegistry;
@@ -56,6 +60,7 @@ class GatewayStreamTest {
     }
 
     @LocalServerPort int port;
+    @Autowired MeterRegistry meters;
     final HttpClient client = HttpClient.newHttpClient();
 
     HttpResponse<InputStream> open(String query, String ip, boolean withToken) throws Exception {
@@ -88,6 +93,18 @@ class GatewayStreamTest {
         // the service takes about 3 s to send them all; the first must not wait for the last
         assertThat(arrivals.get(0)).isLessThan(1500);
         assertThat(arrivals.get(29) - arrivals.get(0)).isGreaterThan(2000);
+    }
+
+    @Test
+    void streamsDontCountAsSlowRequests() throws Exception {
+        HttpResponse<InputStream> res = open("n=25", "198.18.1.9", true);
+        try (InputStream in = res.body()) {
+            in.readAllBytes(); // a 2.5 s stream
+        }
+        for (Timer t : meters.find("http.server.requests").timers()) {
+            assertThat(t.max(TimeUnit.MILLISECONDS)).as(t.getId().toString()).isLessThan(2000);
+        }
+        assertThat(meters.find("gateway.streams.opened").counter().count()).isPositive();
     }
 
     @Test
