@@ -75,6 +75,11 @@ class GatewayTest {
         r.add("sprout.gateway.routes[2].prefix", () -> "/api/flaky");
         r.add("sprout.gateway.routes[2].target", () -> up);
         r.add("sprout.gateway.routes[2].public[0]", () -> "GET /v1/fail");
+        // TEST-NET-1: never answers, so connecting times out (like a host that was just killed)
+        r.add("sprout.gateway.routes[3].name", () -> "blackhole");
+        r.add("sprout.gateway.routes[3].prefix", () -> "/api/blackhole");
+        r.add("sprout.gateway.routes[3].target", () -> "http://192.0.2.1:9");
+        r.add("sprout.gateway.routes[3].public[0]", () -> "GET /v1/anything");
     }
 
     @LocalServerPort int port;
@@ -159,6 +164,16 @@ class GatewayTest {
         var res = send("GET", "/api/down/v1/anything", null, Map.of());
         assertThat(res.statusCode()).isEqualTo(503);
         assertThat(JSON.readTree(res.body()).path("code").asText()).isEqualTo("UPSTREAM_UNAVAILABLE");
+    }
+
+    @Test
+    void aServiceThatNeverAcceptsTheConnectionIs503NotA504() throws Exception {
+        long start = System.nanoTime();
+        var res = send("GET", "/api/blackhole/v1/anything", null, Map.of());
+        long ms = (System.nanoTime() - start) / 1_000_000;
+        assertThat(res.statusCode()).as("the request never arrived, so it's safe to retry").isEqualTo(503);
+        assertThat(res.headers().firstValue("retry-after")).isPresent();
+        assertThat(ms).isLessThan(3000);
     }
 
     @Test
