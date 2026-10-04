@@ -14,7 +14,7 @@
   <!-- Published through JitPack from git tags: com.github.SaiNayakk:sprout-gateway:<tag> -->
   <groupId>com.github.SaiNayakk</groupId>
   <artifactId>sprout-gateway</artifactId>
-  <version>0.2.0</version>
+  <version>0.2.1</version>
   <name>sprout-gateway</name>
   <description>The single entry point for Sprout: token checks, rate limits, routing and request ids.</description>
 
