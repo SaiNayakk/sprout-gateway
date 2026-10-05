@@ -5,6 +5,9 @@ import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
 import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.tracing.Span;
+import io.micrometer.tracing.Tracer;
+import io.micrometer.tracing.propagation.Propagator;
 import jakarta.servlet.AsyncContext;
 import jakarta.servlet.AsyncEvent;
 import jakarta.servlet.AsyncListener;
@@ -29,6 +32,7 @@ import java.util.Optional;
 import java.util.Set;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
@@ -61,8 +65,13 @@ public class ProxyController {
     private final CircuitBreakerRegistry breakers;
     private final List<GatewayProperties.Route> routes;
     private final StreamSlots slots;
+    private final ObjectProvider<Tracer> tracer;
+    private final ObjectProvider<Propagator> propagator;
 
-    public ProxyController(GatewayProperties props, TokenVerifier tokens, RateLimiter limiter, MeterRegistry meters) {
+    public ProxyController(GatewayProperties props, TokenVerifier tokens, RateLimiter limiter, MeterRegistry meters,
+                           ObjectProvider<Tracer> tracer, ObjectProvider<Propagator> propagator) {
+        this.tracer = tracer;
+        this.propagator = propagator;
         this.props = props;
         this.tokens = tokens;
         this.limiter = limiter;
@@ -299,6 +308,13 @@ public class ProxyController {
             b.header("X-User-Id", c.userId());
             b.header("X-Session-Id", c.sessionId());
         });
+        // the service's work joins the gateway's trace (the client's was dropped at the edge)
+        Tracer t = tracer.getIfAvailable();
+        Propagator p = propagator.getIfAvailable();
+        Span span = t == null ? null : t.currentSpan();
+        if (span != null && p != null) {
+            p.inject(span.context(), b, HttpRequest.Builder::setHeader);
+        }
         return b.build();
     }
 

@@ -150,6 +150,18 @@ class GatewayTest {
     }
 
     @Test
+    void aClientsTraceNeverReachesAService() throws Exception {
+        var res = send("POST", "/api/identity/v1/sessions", "{}", Map.of(
+                "traceparent", "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+                "tracestate", "evil=1", "baggage", "userId=someone-else", "b3", "0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-1"));
+        JsonNode headers = JSON.readTree(res.body()).path("headers");
+        assertThat(headers.path("traceparent").asText()).doesNotContain("0af7651916cd43dd8448eb211c80319c");
+        assertThat(headers.has("tracestate")).isFalse();
+        assertThat(headers.has("baggage")).isFalse();
+        assertThat(headers.has("b3")).isFalse();
+    }
+
+    @Test
     void responsesCarrySecurityHeaders() throws Exception {
         var res = send("POST", "/api/identity/v1/sessions", "{}", Map.of());
         assertThat(res.headers().firstValue("x-content-type-options")).hasValue("nosniff");
