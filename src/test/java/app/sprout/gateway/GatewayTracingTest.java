@@ -15,12 +15,11 @@ import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
-/** With tracing on, every call a service gets is part of a trace the gateway started, never the client's. */
+/** With the default settings (traces carried, not exported), every call a service gets is part of a trace the gateway started, never the client's. */
 @AutoConfigureObservability
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {
         "spring.config.name=gateway",
         "management.server.port=0",
-        "management.tracing.enabled=true",
         "management.otlp.tracing.endpoint=http://127.0.0.1:9/v1/traces"})
 class GatewayTracingTest {
 
