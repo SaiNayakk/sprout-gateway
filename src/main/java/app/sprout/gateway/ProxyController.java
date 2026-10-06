@@ -53,6 +53,13 @@ public class ProxyController {
     private static final Set<String> HOP_BY_HOP = Set.of("connection", "keep-alive", "proxy-authenticate",
             "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "host", "content-length",
             "expect");
+    /**
+     * What services call each other on (/internal, and the exchange's, depository's and bank's partner doors) and
+     * their monitoring. Each is also protected by a key or a signature, but none of it is for the public, so the
+     * edge never forwards it: a leaked or guessed key then still can't be used from outside.
+     */
+    private static final java.util.regex.Pattern SERVICE_ONLY = java.util.regex.Pattern.compile("^/(internal|partner|member|participant|actuator)(/.*)?$");
+
     /** Identity headers only the gateway may set; a client sending them is ignored. */
     private static final Set<String> SPOOFABLE = Set.of("x-user-id", "x-session-id", "x-forwarded-for",
             "x-forwarded-proto", "x-forwarded-host", "x-real-ip", "forwarded");
@@ -108,6 +115,10 @@ public class ProxyController {
         String lowerPath = path.toLowerCase(Locale.ROOT);
         if (path.isEmpty() || path.contains("..") || path.contains("//") || lowerPath.contains("%2e")
                 || lowerPath.contains("%2f") || lowerPath.contains("%5c") || path.contains("\\")) {
+            Problems.write(res, 404, "NOT_FOUND", "Not found", "There's no API at this address.", null);
+            return;
+        }
+        if (SERVICE_ONLY.matcher(lowerPath).matches()) {
             Problems.write(res, 404, "NOT_FOUND", "Not found", "There's no API at this address.", null);
             return;
         }
