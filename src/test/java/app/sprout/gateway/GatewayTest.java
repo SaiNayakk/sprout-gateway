@@ -162,6 +162,23 @@ class GatewayTest {
     }
 
     @Test
+    void whatServicesCallEachOtherOnIsNeverForwardedFromTheOutside() throws Exception {
+        // the stand-in service answers 200 to any path, so a 404 here can only have come from the gateway
+        for (String path : new String[] {"/internal/v1/orders", "/partner/v1/payouts", "/member/v1/trades", "/participant/v1/holdings",
+                "/actuator/prometheus", "/Internal/v1/orders", "/internal"}) {
+            for (String token : new String[] {null, "valid"}) {
+                Map<String, String> headers = token == null ? Map.of() : Map.of("Authorization", "Bearer "
+                        + token(KEY, UUID.randomUUID().toString(), "sprout", Instant.now().plusSeconds(600)));
+                var res = send("POST", "/api/identity" + path, "{}", headers);
+                assertThat(res.statusCode()).as(path + (token == null ? "" : " signed in")).isEqualTo(404);
+                assertThat(JSON.readTree(res.body()).path("code").asText()).isEqualTo("NOT_FOUND");
+            }
+        }
+        assertThat(send("GET", "/api/identity/v1/internal-looking-but-fine", null, Map.of()).statusCode())
+                .as("only the namespaces are blocked: this reaches the sign-in check instead").isEqualTo(401);
+    }
+
+    @Test
     void responsesCarrySecurityHeaders() throws Exception {
         var res = send("POST", "/api/identity/v1/sessions", "{}", Map.of());
         assertThat(res.headers().firstValue("x-content-type-options")).hasValue("nosniff");
