@@ -17,12 +17,28 @@ public record GatewayProperties(
         boolean trustCloudflareIp,
         RateLimits rateLimits,
         Streams streams,
-        List<Route> routes) {
+        List<Route> routes,
+        Cell cell) {
 
     public record RateLimits(int authPerMinute, int defaultPerMinute) {}
 
     /** Long-lived Server-Sent Events streams: how many one client, and everyone, may hold open. */
     public record Streams(int perClient, int total) {}
+
+    /**
+     * Running as one of two cells (ADR-027). {@code id} is this cell's name; empty means not a cell, and none of
+     * this applies. Before a customer's write is forwarded it is appended to the journal in the other cell
+     * ({@code peerUrl}, authenticated with the cells' shared {@code key}), so that if this cell is lost the other
+     * can replay it; writes to {@code unjournaled} prefixes (sign-in, the sandbox) aren't. This cell keeps the
+     * other's journal in {@code journalDir}. While {@code fenceFile} exists, this cell takes no writes.
+     */
+    public record Cell(String id, String peerUrl, String key, Duration journalTimeout, String journalDir, String fenceFile,
+                       List<String> unjournaled) {
+
+        public boolean enabled() {
+            return id != null && !id.isBlank();
+        }
+    }
 
     /**
      * Requests under {@code prefix} go to {@code target} with the prefix removed. Endpoints are

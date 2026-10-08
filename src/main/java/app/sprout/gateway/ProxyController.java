@@ -30,6 +30,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
@@ -62,7 +63,10 @@ public class ProxyController {
 
     /** Identity headers only the gateway may set; a client sending them is ignored. */
     private static final Set<String> SPOOFABLE = Set.of("x-user-id", "x-session-id", "x-forwarded-for",
-            "x-forwarded-proto", "x-forwarded-host", "x-real-ip", "forwarded");
+            "x-forwarded-proto", "x-forwarded-host", "x-real-ip", "forwarded",
+            "x-cell-key", "x-cell-replay-key", "x-cell-replay-user");
+    private static final java.util.regex.Pattern UUID_SHAPE =
+            java.util.regex.Pattern.compile("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$");
 
     private final GatewayProperties props;
     private final TokenVerifier tokens;
@@ -74,9 +78,11 @@ public class ProxyController {
     private final StreamSlots slots;
     private final ObjectProvider<Tracer> tracer;
     private final ObjectProvider<Propagator> propagator;
+    private final CellJournal journal;
 
     public ProxyController(GatewayProperties props, TokenVerifier tokens, RateLimiter limiter, MeterRegistry meters,
-                           ObjectProvider<Tracer> tracer, ObjectProvider<Propagator> propagator) {
+                           ObjectProvider<Tracer> tracer, ObjectProvider<Propagator> propagator, CellJournal journal) {
+        this.journal = journal;
         this.tracer = tracer;
         this.propagator = propagator;
         this.props = props;
@@ -124,10 +130,26 @@ public class ProxyController {
         }
         String method = req.getMethod().toUpperCase(Locale.ROOT);
         String client = clientAddress(req);
+        boolean write = CellJournal.isWrite(method);
+
+        // A write replayed by the cell taking this cell's customers over (ADR-027): it carries the cells' shared key
+        // and names the customer, whose token expired long ago. It isn't rate limited and isn't journalled again.
+        String replayUser = journal.enabled() ? req.getHeader("X-Cell-Replay-User") : null;
+        if (replayUser != null) {
+            if (!journal.isCellKey(req.getHeader("X-Cell-Replay-Key")) || !UUID_SHAPE.matcher(replayUser).matches()) {
+                Problems.write(res, 401, "UNAUTHENTICATED", "Not a cell", "Only a cell may replay writes.", null);
+                return;
+            }
+        } else if (write && journal.fenced()) {
+            meters.counter("gateway.cell.fenced_writes", "route", route.name()).increment();
+            Problems.write(res, 503, "UPSTREAM_UNAVAILABLE", "Temporarily unavailable",
+                    "Your account is moving to another server. Try again in a minute.", 60L);
+            return;
+        }
 
         boolean authLimited = route.isAuthLimited(method, path);
         int perMinute = authLimited ? props.rateLimits().authPerMinute() : props.rateLimits().defaultPerMinute();
-        long wait = limiter.tryAcquire(client + "|" + (authLimited ? "auth" : "default"), perMinute);
+        long wait = replayUser != null ? 0 : limiter.tryAcquire(client + "|" + (authLimited ? "auth" : "default"), perMinute);
         if (wait > 0) {
             meters.counter("gateway.rate_limited", "route", route.name(), "class", authLimited ? "auth" : "default").increment();
             Problems.write(res, 429, "RATE_LIMITED", "Too many requests",
@@ -135,7 +157,9 @@ public class ProxyController {
             return;
         }
 
-        Optional<TokenVerifier.Caller> caller = tokens.verify(req.getHeader("Authorization"));
+        Optional<TokenVerifier.Caller> caller = replayUser != null
+                ? Optional.of(new TokenVerifier.Caller(replayUser, "cell-replay"))
+                : tokens.verify(req.getHeader("Authorization"));
         if (caller.isEmpty() && !route.isPublic(method, path)) {
             meters.counter("gateway.unauthenticated", "route", route.name()).increment();
             Problems.write(res, 401, "UNAUTHENTICATED", "Sign in to continue",
@@ -155,7 +179,24 @@ public class ProxyController {
             return;
         }
 
-        HttpRequest upstream = buildUpstream(req, route, path, method, body, client, caller);
+        // Every write the other cell may have to replay carries an idempotency key, so a replay of something that had
+        // already happened is recognised; a client that sent none is given one, and told it.
+        String key = req.getHeader("Idempotency-Key");
+        String addedKey = null;
+        if (write && journal.covers(uri) && (key == null || key.isBlank())) {
+            addedKey = UUID.randomUUID().toString();
+            key = addedKey;
+            res.setHeader("Idempotency-Key", addedKey);
+        }
+        if (write && replayUser == null && caller.isPresent() && journal.covers(uri)) {
+            boolean journalled = journal.send(new CellJournal.Entry(journal.cellId(), caller.get().userId(), method, uri,
+                    req.getQueryString(), key, req.getContentType(), body, (String) req.getAttribute(EdgeFilter.REQUEST_ID)));
+            if (!journalled) {
+                res.setHeader("X-Sprout-Protection", "unprotected");
+            }
+        }
+
+        HttpRequest upstream = buildUpstream(req, route, path, method, body, client, caller, addedKey);
         CircuitBreaker breaker = breakers.circuitBreaker(route.name());
         try {
             HttpResponse<byte[]> reply = breaker.executeCheckedSupplier(
@@ -209,7 +250,7 @@ public class ProxyController {
         }
         boolean handedOver = false;
         try {
-            HttpRequest upstream = buildUpstream(req, route, path, method, new byte[0], client, caller);
+            HttpRequest upstream = buildUpstream(req, route, path, method, new byte[0], client, caller, null);
             HttpResponse<InputStream> reply;
             try {
                 // the timeout covers getting the response headers; the body then flows for as long as it lasts
@@ -298,7 +339,7 @@ public class ProxyController {
     }
 
     private HttpRequest buildUpstream(HttpServletRequest req, GatewayProperties.Route route, String path, String method,
-                                      byte[] body, String client, Optional<TokenVerifier.Caller> caller) {
+                                      byte[] body, String client, Optional<TokenVerifier.Caller> caller, String addedKey) {
         String query = req.getQueryString();
         URI target = URI.create(route.target() + path + (query == null ? "" : "?" + query));
         HttpRequest.Builder b = HttpRequest.newBuilder(target).timeout(props.requestTimeout())
@@ -313,6 +354,9 @@ public class ProxyController {
             }
         }
         b.header(EdgeFilter.REQUEST_ID, (String) req.getAttribute(EdgeFilter.REQUEST_ID));
+        if (addedKey != null) {
+            b.header("Idempotency-Key", addedKey);
+        }
         b.header("X-Forwarded-For", client);
         b.header("X-Forwarded-Proto", req.getHeader("CF-Visitor") != null ? "https" : req.getScheme());
         caller.ifPresent(c -> {

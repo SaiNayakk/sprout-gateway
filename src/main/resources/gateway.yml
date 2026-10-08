@@ -72,6 +72,18 @@ sprout:
     streams:
       per-client: 5
       total: 500
+    # One of two cells (ADR-027): empty id = not a cell. The other cell's journal of this cell's writes is what lets
+    # it take this cell's customers over without losing a write.
+    cell:
+      id: ${GATEWAY_CELL_ID:}
+      peer-url: ${GATEWAY_CELL_PEER_URL:}
+      key: ${GATEWAY_CELL_KEY:}
+      journal-timeout: ${GATEWAY_CELL_JOURNAL_TIMEOUT:2s}
+      journal-dir: ${GATEWAY_CELL_JOURNAL_DIR:}
+      fence-file: ${GATEWAY_CELL_FENCE_FILE:}
+      unjournaled:
+        - /api/identity     # sign-in and tokens: losing one means signing in again; replaying a refresh trips theft detection
+        - /api/sandbox      # demo accounts are handed out per cell
     routes:
       - name: identity
         prefix: /api/identity
