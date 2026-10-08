@@ -46,8 +46,8 @@ public class CellJournal {
     private static final DateTimeFormatter HOUR = DateTimeFormatter.ofPattern("yyyyMMddHH").withZone(ZoneOffset.UTC);
     static final Duration KEEP = Duration.ofHours(2);
 
-    /** One write, as journalled. {@code body} is the raw request body. */
-    public record Entry(String cell, String userId, String method, String uri, String query, String idempotencyKey,
+    /** One write, as journalled. {@code id} names the entry; {@code body} is the raw request body. */
+    public record Entry(String id, String cell, String userId, String method, String uri, String query, String idempotencyKey,
                         String contentType, byte[] body, String requestId) {}
 
     private final GatewayProperties.Cell cell;
@@ -133,9 +133,34 @@ public class CellJournal {
         }
     }
 
+    /**
+     * Tells the other cell that a journalled write was refused (4xx) and the customer told so, so a replay doesn't make
+     * it happen after all. Sent without waiting: if this note is lost, the replay is still safe for keyed writes, and
+     * the window is the moment between the answer and this cell being lost.
+     */
+    public void noteRefused(String entryId, int status) {
+        if (cell.peerUrl() == null || cell.peerUrl().isBlank()) {
+            return;
+        }
+        try {
+            ObjectNode n = json.createObjectNode();
+            n.put("cell", cell.id());
+            n.put("outcomeOf", entryId);
+            n.put("status", status);
+            n.put("at", clock.instant().toString());
+            HttpRequest req = HttpRequest.newBuilder(URI.create(cell.peerUrl() + "/api/cells/v1/journal"))
+                    .timeout(cell.journalTimeout() == null ? Duration.ofSeconds(2) : cell.journalTimeout())
+                    .header("Content-Type", "application/json").header("X-Cell-Key", cell.key())
+                    .POST(HttpRequest.BodyPublishers.ofByteArray(json.writeValueAsBytes(n))).build();
+            http.sendAsync(req, HttpResponse.BodyHandlers.discarding());
+        } catch (Exception ignored) {
+            // best effort, as above
+        }
+    }
+
     ObjectNode line(Entry e) {
         ObjectNode n = json.createObjectNode();
-        n.put("id", UUID.randomUUID().toString());
+        n.put("id", e.id());
         n.put("at", clock.instant().toString());
         n.put("cell", e.cell());
         n.put("userId", e.userId());

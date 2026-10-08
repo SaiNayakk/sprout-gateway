@@ -43,13 +43,14 @@ public class CellJournalController {
         } catch (IOException e) {
             entry = null;
         }
-        if (!(entry instanceof ObjectNode o) || !o.hasNonNull("method") || !o.hasNonNull("uri") || !o.hasNonNull("userId")
-                || !o.hasNonNull("idempotencyKey") || !o.hasNonNull("cell")) {
+        boolean note = entry instanceof ObjectNode n && n.hasNonNull("outcomeOf") && n.hasNonNull("status") && n.hasNonNull("cell");
+        if (!note && (!(entry instanceof ObjectNode o) || !o.hasNonNull("method") || !o.hasNonNull("uri") || !o.hasNonNull("userId")
+                || !o.hasNonNull("idempotencyKey") || !o.hasNonNull("cell"))) {
             Problems.write(res, 400, "VALIDATION_FAILED", "Invalid entry",
                     "Send a journal entry: cell, userId, method, uri, idempotencyKey and body.", null);
             return;
         }
-        journal.append(o);
+        journal.append((ObjectNode) entry);
         res.setStatus(204);
     }
 }

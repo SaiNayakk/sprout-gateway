@@ -46,7 +46,7 @@ import org.springframework.test.context.DynamicPropertySource;
 class GatewayCellTest {
 
     static final ObjectMapper JSON = new ObjectMapper();
-    static final HttpServer UPSTREAM = GatewayTest.startUpstream();
+    static final HttpServer UPSTREAM = upstream();
     /** The other cell: what it was sent, and whether it answers. */
     static final List<JsonNode> PEER_GOT = new CopyOnWriteArrayList<>();
     static final AtomicInteger PEER_STATUS = new AtomicInteger(204);
@@ -96,6 +96,18 @@ class GatewayCellTest {
         assertThat(e.path("idempotencyKey").asText()).isEqualTo("order-key-12345");
         assertThat(new String(Base64.getDecoder().decode(e.path("body").asText()), StandardCharsets.UTF_8)).isEqualTo("{\"symbol\":\"SUNROOT\"}");
         assertThat(res.headers().firstValue("X-Sprout-Protection")).isEmpty();
+    }
+
+    @Test
+    void aWriteTheServiceRefusesIsNotedSoAReplayLeavesItRefused() throws Exception {
+        var res = send("POST", "/api/oms/v1/refuse", "{}", Map.of("Authorization", bearer(), "Idempotency-Key", "order-key-refused"));
+        assertThat(res.statusCode()).isEqualTo(422);
+        String id = PEER_GOT.get(0).path("id").asText();
+        for (int i = 0; i < 50 && PEER_GOT.size() < 2; i++) {
+            Thread.sleep(50);   // the note is sent without waiting
+        }
+        assertThat(PEER_GOT.get(1).path("outcomeOf").asText()).isEqualTo(id);
+        assertThat(PEER_GOT.get(1).path("status").asInt()).isEqualTo(422);
     }
 
     @Test
@@ -175,6 +187,18 @@ class GatewayCellTest {
                 .method(method, body == null ? HttpRequest.BodyPublishers.noBody() : HttpRequest.BodyPublishers.ofString(body));
         headers.forEach(b::header);
         return client.send(b.build(), HttpResponse.BodyHandlers.ofString());
+    }
+
+    /** The gateway test's stub, plus an address that refuses every write (422). */
+    static HttpServer upstream() {
+        HttpServer s = GatewayTest.startUpstream();
+        s.createContext("/v1/refuse", ex -> {
+            byte[] b = "{\"code\":\"VALIDATION_FAILED\"}".getBytes(StandardCharsets.UTF_8);
+            ex.sendResponseHeaders(422, b.length);
+            ex.getResponseBody().write(b);
+            ex.close();
+        });
+        return s;
     }
 
     static HttpServer peer() {
