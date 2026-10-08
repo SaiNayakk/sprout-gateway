@@ -188,10 +188,13 @@ public class ProxyController {
             key = addedKey;
             res.setHeader("Idempotency-Key", addedKey);
         }
+        String journalled = null;   // the journal entry's id, once the other cell has it
         if (write && replayUser == null && caller.isPresent() && journal.covers(uri)) {
-            boolean journalled = journal.send(new CellJournal.Entry(journal.cellId(), caller.get().userId(), method, uri,
-                    req.getQueryString(), key, req.getContentType(), body, (String) req.getAttribute(EdgeFilter.REQUEST_ID)));
-            if (!journalled) {
+            String id = UUID.randomUUID().toString();
+            if (journal.send(new CellJournal.Entry(id, journal.cellId(), caller.get().userId(), method, uri, req.getQueryString(),
+                    key, req.getContentType(), body, (String) req.getAttribute(EdgeFilter.REQUEST_ID)))) {
+                journalled = id;
+            } else {
                 res.setHeader("X-Sprout-Protection", "unprotected");
             }
         }
@@ -201,6 +204,9 @@ public class ProxyController {
         try {
             HttpResponse<byte[]> reply = breaker.executeCheckedSupplier(
                     () -> http.send(upstream, HttpResponse.BodyHandlers.ofByteArray()));
+            if (journalled != null && reply.statusCode() >= 400 && reply.statusCode() < 500) {
+                journal.noteRefused(journalled, reply.statusCode());
+            }
             copyReply(reply, res);
         } catch (CallNotPermittedException e) {
             meters.counter("gateway.upstream_errors", "route", route.name(), "kind", "circuit_open").increment();
