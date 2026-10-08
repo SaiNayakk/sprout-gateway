@@ -64,7 +64,7 @@ public class ProxyController {
     /** Identity headers only the gateway may set; a client sending them is ignored. */
     private static final Set<String> SPOOFABLE = Set.of("x-user-id", "x-session-id", "x-forwarded-for",
             "x-forwarded-proto", "x-forwarded-host", "x-real-ip", "forwarded",
-            "x-cell-key", "x-cell-replay-key", "x-cell-replay-user");
+            "x-cell-key", "x-cell-replay-key", "x-cell-replay-user", "x-sprout-client-ip");
     private static final java.util.regex.Pattern UUID_SHAPE =
             java.util.regex.Pattern.compile("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$");
 
@@ -396,6 +396,12 @@ public class ProxyController {
     }
 
     private String clientAddress(HttpServletRequest req) {
+        // the other cell forwarding one of this cell's customers (ADR-027): Cloudflare names that cell as the client,
+        // so the cell names the real one, and is believed only with the cells' key
+        String forwarded = req.getHeader("X-Sprout-Client-IP");
+        if (forwarded != null && !forwarded.isBlank() && journal.isCellKey(req.getHeader("X-Cell-Key"))) {
+            return forwarded.trim();
+        }
         String cf = req.getHeader("CF-Connecting-IP");
         if (props.trustCloudflareIp() && cf != null && !cf.isBlank()) {
             return cf.trim();

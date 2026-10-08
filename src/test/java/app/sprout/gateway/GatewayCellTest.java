@@ -176,6 +176,17 @@ class GatewayCellTest {
         }
     }
 
+    @Test
+    void theOtherCellCanNameTheRealClientOnlyWithTheCellsKey() throws Exception {
+        var trusted = send("GET", "/api/oms/v1/orders", null, Map.of("Authorization", bearer(),
+                "X-Cell-Key", "cells-shared-key-for-tests", "X-Sprout-Client-IP", "203.0.113.7"));
+        JsonNode h = JSON.readTree(trusted.body()).path("headers");
+        assertThat(h.path("x-forwarded-for").asText()).isEqualTo("203.0.113.7");
+        assertThat(h.has("x-sprout-client-ip")).as("not passed on").isFalse();
+        var untrusted = send("GET", "/api/oms/v1/orders", null, Map.of("Authorization", bearer(), "X-Sprout-Client-IP", "203.0.113.7"));
+        assertThat(JSON.readTree(untrusted.body()).path("headers").path("x-forwarded-for").asText()).isNotEqualTo("203.0.113.7");
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────
 
     String bearer() throws Exception {
