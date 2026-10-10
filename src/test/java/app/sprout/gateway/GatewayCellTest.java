@@ -42,7 +42,8 @@ import org.springframework.test.context.DynamicPropertySource;
         "sprout.gateway.rate-limits.default-per-minute=1000",
         "sprout.gateway.cell.id=a",
         "sprout.gateway.cell.key=cells-shared-key-for-tests",
-        "sprout.gateway.cell.journal-timeout=1s"})
+        "sprout.gateway.cell.journal-timeout=1s",
+        "sprout.gateway.cell.journal-circuit-open=2s"})
 class GatewayCellTest {
 
     static final ObjectMapper JSON = new ObjectMapper();
@@ -50,6 +51,8 @@ class GatewayCellTest {
     /** The other cell: what it was sent, and whether it answers. */
     static final List<JsonNode> PEER_GOT = new CopyOnWriteArrayList<>();
     static final AtomicInteger PEER_STATUS = new AtomicInteger(204);
+    /** How long the other cell takes to answer, to make it slow. */
+    static final AtomicInteger PEER_DELAY_MS = new AtomicInteger(0);
     static final HttpServer PEER = peer();
     static final Path DIR = tempDir();
     static final Path FENCE = DIR.resolve("fenced");
@@ -71,6 +74,7 @@ class GatewayCellTest {
     }
 
     @LocalServerPort int port;
+    @org.springframework.beans.factory.annotation.Autowired CellJournal journal;
     final HttpClient client = HttpClient.newHttpClient();
     final String user = UUID.randomUUID().toString();
 
@@ -78,6 +82,8 @@ class GatewayCellTest {
     void reset() throws IOException {
         PEER_GOT.clear();
         PEER_STATUS.set(204);
+        PEER_DELAY_MS.set(0);
+        journal.resetCircuit();
         Files.deleteIfExists(FENCE);
     }
 
@@ -131,6 +137,55 @@ class GatewayCellTest {
         var res = send("POST", "/api/oms/v1/orders", "{}", Map.of("Authorization", bearer(), "Idempotency-Key", "order-key-67890"));
         assertThat(res.statusCode()).isEqualTo(200);
         assertThat(res.headers().firstValue("X-Sprout-Protection")).hasValue("unprotected");
+    }
+
+    @Test
+    void aSlowOtherCellStopsCostingEveryWriteItsTimeout() throws Exception {
+        PEER_DELAY_MS.set(1500);   // longer than the journal timeout of 1 s
+        long slowest = 0;
+        for (int i = 0; i < 5; i++) {
+            long t0 = System.nanoTime();
+            var res = send("POST", "/api/oms/v1/orders", "{}", Map.of("Authorization", bearer(), "Idempotency-Key", "slow-key-" + i + "-12345"));
+            slowest = Math.max(slowest, (System.nanoTime() - t0) / 1_000_000);
+            assertThat(res.statusCode()).as("the write goes ahead").isEqualTo(200);
+            assertThat(res.headers().firstValue("X-Sprout-Protection")).hasValue("unprotected");
+        }
+        assertThat(journal.circuitOpen()).as("after a few timeouts the circuit is open").isTrue();
+        long t0 = System.nanoTime();
+        var res = send("POST", "/api/oms/v1/orders", "{}", Map.of("Authorization", bearer(), "Idempotency-Key", "slow-key-after-12345"));
+        long took = (System.nanoTime() - t0) / 1_000_000;
+        assertThat(res.statusCode()).isEqualTo(200);
+        assertThat(res.headers().firstValue("X-Sprout-Protection")).hasValue("unprotected");
+        assertThat(took).as("no longer waits for the journal (ms)").isLessThan(500);
+        assertThat(slowest).as("while closed, a write did wait (ms)").isGreaterThan(900);
+    }
+
+    @Test
+    void theCircuitClosesAgainWhenTheOtherCellIsBack() throws Exception {
+        PEER_STATUS.set(503);
+        for (int i = 0; i < 5; i++) {
+            send("POST", "/api/oms/v1/orders", "{}", Map.of("Authorization", bearer(), "Idempotency-Key", "down-key-" + i + "-12345"));
+        }
+        assertThat(journal.circuitOpen()).isTrue();
+        PEER_STATUS.set(204);
+        Thread.sleep(2300);   // the circuit stays open for 2 s in this test
+        for (int i = 0; i < 3; i++) {   // two trial calls close it
+            send("POST", "/api/oms/v1/orders", "{}", Map.of("Authorization", bearer(), "Idempotency-Key", "back-key-" + i + "-12345"));
+        }
+        assertThat(journal.circuitOpen()).isFalse();
+        var res = send("POST", "/api/oms/v1/orders", "{}", Map.of("Authorization", bearer(), "Idempotency-Key", "back-key-final-12345"));
+        assertThat(res.headers().firstValue("X-Sprout-Protection")).isEmpty();
+    }
+
+    @Test
+    void everyWriteThatWentAheadUnprotectedIsWrittenDownHere() throws Exception {
+        PEER_STATUS.set(503);
+        send("POST", "/api/oms/v1/orders", "{}", Map.of("Authorization", bearer(), "Idempotency-Key", "noted-key-12345"));
+        try (Stream<Path> files = Files.list(DIR.resolve("journal"))) {
+            var marks = files.filter(f -> f.getFileName().toString().startsWith("unprotected-a-")).toList();
+            assertThat(marks).isNotEmpty();
+            assertThat(Files.readString(marks.get(0))).contains("\"why\":\"refused with 503\"");
+        }
     }
 
     @Test
@@ -215,8 +270,16 @@ class GatewayCellTest {
     static HttpServer peer() {
         try {
             HttpServer s = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+            s.setExecutor(java.util.concurrent.Executors.newCachedThreadPool());   // a slow answer must not hold up the next
             s.createContext("/api/cells/v1/journal", ex -> {
-                if ("cells-shared-key-for-tests".equals(ex.getRequestHeaders().getFirst("X-Cell-Key")) && PEER_STATUS.get() == 204) {
+                int delay = PEER_DELAY_MS.get();
+                try {
+                    Thread.sleep(delay);
+                } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
+                }
+                // a delayed request outlives its test (the gateway gave up on it): it is not recorded
+                if (delay == 0 && "cells-shared-key-for-tests".equals(ex.getRequestHeaders().getFirst("X-Cell-Key")) && PEER_STATUS.get() == 204) {
                     PEER_GOT.add(JSON.readTree(ex.getRequestBody().readAllBytes()));
                 }
                 ex.sendResponseHeaders(PEER_STATUS.get(), -1);

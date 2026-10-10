@@ -2,6 +2,8 @@ package app.sprout.gateway;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
 import io.micrometer.core.instrument.MeterRegistry;
 import java.io.IOException;
 import java.net.URI;
@@ -24,6 +26,7 @@ import java.util.Base64;
 import java.util.Locale;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -45,6 +48,8 @@ public class CellJournal {
     private static final Set<String> WRITES = Set.of("POST", "PUT", "PATCH", "DELETE");
     private static final DateTimeFormatter HOUR = DateTimeFormatter.ofPattern("yyyyMMddHH").withZone(ZoneOffset.UTC);
     static final Duration KEEP = Duration.ofHours(2);
+    /** How long the journal's circuit stays open after the other cell has failed to answer, before it tries again. */
+    static final Duration OPEN_FOR = Duration.ofSeconds(15);
 
     /** One write, as journalled. {@code id} names the entry; {@code body} is the raw request body. */
     public record Entry(String id, String cell, String userId, String method, String uri, String query, String idempotencyKey,
@@ -55,6 +60,7 @@ public class CellJournal {
     private final MeterRegistry meters;
     private final Clock clock;
     private final HttpClient http;
+    private final CircuitBreaker breaker;
 
     public CellJournal(GatewayProperties props, ObjectMapper json, MeterRegistry meters) {
         this.cell = props.cell();
@@ -63,6 +69,12 @@ public class CellJournal {
         this.clock = Clock.systemUTC();
         Duration timeout = cell == null || cell.journalTimeout() == null ? Duration.ofSeconds(2) : cell.journalTimeout();
         this.http = HttpClient.newBuilder().connectTimeout(timeout).build();
+        this.breaker = CircuitBreaker.of("cell-journal", CircuitBreakerConfig.custom()
+                .slidingWindowType(CircuitBreakerConfig.SlidingWindowType.COUNT_BASED)
+                .slidingWindowSize(10).minimumNumberOfCalls(4).failureRateThreshold(50)
+                .waitDurationInOpenState(cell != null && cell.journalCircuitOpen() != null ? cell.journalCircuitOpen() : OPEN_FOR)
+                .permittedNumberOfCallsInHalfOpenState(2)
+                .automaticTransitionFromOpenToHalfOpenEnabled(true).build());
     }
 
     public boolean enabled() {
@@ -112,6 +124,15 @@ public class CellJournal {
             meters.counter("gateway.cell.journal", "outcome", "no_peer").increment();
             return false;
         }
+        // Every write waits for this call, so a slow or unreachable other cell must not cost every write its timeout (found by
+        // an experiment: a frozen peer cut this cell's throughput from 40 to 6 orders a second). After a few failures the circuit
+        // opens and writes go ahead unprotected at once; it lets two calls through every OPEN_FOR to see whether the peer is back.
+        if (!breaker.tryAcquirePermission()) {
+            meters.counter("gateway.cell.journal", "outcome", "skipped").increment();
+            unprotected(e, "the journal's circuit is open: the other cell is slow or away");
+            return false;
+        }
+        long start = System.nanoTime();
         try {
             HttpRequest req = HttpRequest.newBuilder(URI.create(cell.peerUrl() + "/api/cells/v1/journal"))
                     .timeout(cell.journalTimeout() == null ? Duration.ofSeconds(2) : cell.journalTimeout())
@@ -119,17 +140,61 @@ public class CellJournal {
                     .POST(HttpRequest.BodyPublishers.ofByteArray(json.writeValueAsBytes(line(e)))).build();
             int status = http.send(req, HttpResponse.BodyHandlers.discarding()).statusCode();
             boolean ok = status == 204;
+            long took = System.nanoTime() - start;
+            if (ok) {
+                breaker.onSuccess(took, TimeUnit.NANOSECONDS);
+            } else {
+                breaker.onError(took, TimeUnit.NANOSECONDS, new IllegalStateException("status " + status));
+            }
             meters.counter("gateway.cell.journal", "outcome", ok ? "journalled" : "refused").increment();
             if (!ok) {
                 log.warn("The other cell refused a journal entry ({}): the write goes ahead unprotected", status);
+                unprotected(e, "refused with " + status);
             }
             return ok;
         } catch (Exception ex) {
             if (ex instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
             }
+            breaker.onError(System.nanoTime() - start, TimeUnit.NANOSECONDS, ex);
             meters.counter("gateway.cell.journal", "outcome", "unreachable").increment();
+            unprotected(e, "unreachable");
             return false;
+        }
+    }
+
+    /** Forgets the journal's failures: the circuit closes. For tests, and for a peer known to be back. */
+    void resetCircuit() {
+        breaker.reset();
+    }
+
+    boolean circuitOpen() {
+        return breaker.getState() != CircuitBreaker.State.CLOSED;
+    }
+
+    /**
+     * Writes down, on this cell's own disk, a write that went ahead without the other cell having it, so that something can alert
+     * on it (the entry itself is not kept: only what and when). Best effort.
+     */
+    private synchronized void unprotected(Entry e, String why) {
+        meters.counter("gateway.cell.unprotected").increment();
+        if (cell.journalDir() == null || cell.journalDir().isBlank()) {
+            return;
+        }
+        try {
+            Path dir = Path.of(cell.journalDir());
+            Files.createDirectories(dir);
+            Instant now = clock.instant();
+            ObjectNode n = json.createObjectNode();
+            n.put("id", e.id());
+            n.put("at", now.toString());
+            n.put("method", e.method());
+            n.put("uri", e.uri());
+            n.put("why", why);
+            Files.writeString(dir.resolve("unprotected-" + cell.id() + "-" + HOUR.format(now) + ".jsonl"), json.writeValueAsString(n) + "\n",
+                    StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+        } catch (IOException ignored) {
+            // the write has gone ahead; this record is a convenience
         }
     }
 

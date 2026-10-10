@@ -30,10 +30,12 @@ public record GatewayProperties(
      * this applies. Before a customer's write is forwarded it is appended to the journal in the other cell
      * ({@code peerUrl}, authenticated with the cells' shared {@code key}), so that if this cell is lost the other
      * can replay it; writes to {@code unjournaled} prefixes (sign-in, the sandbox) aren't. This cell keeps the
-     * other's journal in {@code journalDir}. While {@code fenceFile} exists, this cell takes no writes.
+     * other's journal in {@code journalDir}. While {@code fenceFile} exists, this cell takes no writes. After the other cell
+     * has failed to take a few journal entries, the journal's circuit stays open for {@code journalCircuitOpen} (default 15 s):
+     * writes go ahead unprotected without waiting for it.
      */
     public record Cell(String id, String peerUrl, String key, Duration journalTimeout, String journalDir, String fenceFile,
-                       List<String> unjournaled) {
+                       List<String> unjournaled, Duration journalCircuitOpen) {
 
         public boolean enabled() {
             return id != null && !id.isBlank();
