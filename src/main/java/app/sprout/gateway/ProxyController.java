@@ -157,9 +157,21 @@ public class ProxyController {
             return;
         }
 
-        Optional<TokenVerifier.Caller> caller = replayUser != null
-                ? Optional.of(new TokenVerifier.Caller(replayUser, "cell-replay"))
-                : tokens.verify(req.getHeader("Authorization"));
+        Optional<TokenVerifier.Caller> caller;
+        try {
+            caller = replayUser != null
+                    ? Optional.of(new TokenVerifier.Caller(replayUser, "cell-replay"))
+                    : tokens.verify(req.getHeader("Authorization"));
+        } catch (TokenVerifier.KeysUnavailable e) {
+            meters.counter("gateway.keys_unavailable", "route", route.name()).increment();
+            if (!route.isPublic(method, path)) {
+                // the token may well be good: say "try again", never "sign in again"
+                Problems.write(res, 503, "UPSTREAM_UNAVAILABLE", "Temporarily unavailable",
+                        "We couldn't check your sign-in just now. Try again in a few seconds.", 5L);
+                return;
+            }
+            caller = Optional.empty();   // a public route works signed out
+        }
         if (caller.isEmpty() && !route.isPublic(method, path)) {
             meters.counter("gateway.unauthenticated", "route", route.name()).increment();
             Problems.write(res, 401, "UNAUTHENTICATED", "Sign in to continue",
